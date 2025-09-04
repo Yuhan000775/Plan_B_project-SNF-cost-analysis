@@ -1,0 +1,175 @@
+---
+title: "model OLS LASSO FE 2.0"
+author: "Yuhan Xu"
+date: "2025-08-31"
+output: pdf_document
+---
+
+```{r}
+library(readr)
+library(dplyr)
+library(glmnet)
+library(fixest)
+library(janitor)
+library(broom)
+library(tidyr)
+
+```
+
+
+```{r}
+# ----------------
+# 0) Load data
+# ----------------
+df_train <- read_csv("~/Desktop/Skilled Nursing Facility Cost Report/Final_SNF_CostReport_Cleaned_2012_2019.csv", show_col_types = FALSE)
+df_test  <- read_csv("~/Desktop/Skilled Nursing Facility Cost Report/Final_SNF_CostReport_Cleaned_2020_2021.csv", show_col_types = FALSE)
+
+stopifnot(all(c("Provider CCN","Year","Net Income") %in% names(df_train)))
+stopifnot(all(c("Provider CCN","Year","Net Income") %in% names(df_test)))
+
+df_train <- df_train %>%
+  mutate(`Provider CCN` = as.character(`Provider CCN`),
+         Year = as.integer(Year)) %>%
+  filter(!is.na(`Net Income`))
+
+df_test  <- df_test %>%
+  mutate(`Provider CCN` = as.character(`Provider CCN`),
+         Year = as.integer(Year)) %>%
+  filter(!is.na(`Net Income`))
+```
+
+
+```{r}
+# ----------------
+# 1) Columns & formulas (OLS/LASSO use original names)
+# ----------------
+y  <- "Net Income"
+id <- "Provider CCN"
+tm <- "Year"
+
+predictors <- setdiff(names(df_train), c(y, id, tm))
+rhs <- paste(sprintf("`%s`", predictors), collapse = " + ")
+form_ols <- as.formula(paste0("`", y, "` ~ ", rhs))
+
+```
+
+
+```{r}
+# ======================
+# 2) OLS (train fit + test RMSE)
+# ======================
+ols_fit <- lm(form_ols, data = df_train)
+
+# Train metrics
+ols_glance <- glance(ols_fit)
+
+# Test RMSE
+ols_pred <- predict(ols_fit, newdata = df_test)
+ols_rmse <- sqrt(mean((df_test[[y]] - ols_pred)^2, na.rm = TRUE))
+
+cat("\n=== OLS ===\n")
+print(summary(ols_fit))
+cat("Train R^2 / Adj.R^2: ",
+    round(ols_glance$r.squared, 3), " / ",
+    round(ols_glance$adj.r.squared, 3), "\n", sep = "")
+cat("Test RMSE (2020–2021): ", round(ols_rmse, 2), "\n", sep = "")
+
+```
+
+
+```{r}
+# ======================
+# 3) LASSO (CV on train; test RMSE)
+# ======================
+x_train <- model.matrix(form_ols, data = df_train)[, -1, drop = FALSE]
+y_train <- df_train[[y]]
+
+x_test  <- model.matrix(form_ols, data = df_test)[, -1, drop = FALSE]
+y_test  <- df_test[[y]]
+
+set.seed(123)
+cv_lasso <- cv.glmnet(x = x_train, y = y_train, alpha = 1, standardize = TRUE)
+lasso_fit <- glmnet(x = x_train, y = y_train, alpha = 1,
+                    lambda = cv_lasso$lambda.min, standardize = TRUE)
+
+pred_lasso <- as.numeric(predict(lasso_fit, newx = x_test))
+rmse_lasso <- sqrt(mean((y_test - pred_lasso)^2, na.rm = TRUE))
+lasso_nz   <- sum(as.numeric(coef(lasso_fit)) != 0)
+
+cat("\n=== LASSO ===\n")
+cat("Selected lambda (lambda.min): ", round(cv_lasso$lambda.min, 3), "\n", sep = "")
+cat("Number of non-zero coefficients (incl. intercept): ", lasso_nz, "\n", sep = "")
+cat("LASSO test RMSE (2020–2021): ", round(rmse_lasso, 2), "\n", sep = "")
+
+```
+
+
+```{r}
+# ======================
+# 4) Fixed Effects (fixest) — individual and two-way
+#    Use a SAFE-NAME copy to avoid spaces/special characters issues
+# ======================
+df_all <- bind_rows(df_train, df_test)
+
+df_tmp <- df_all %>%
+  as.data.frame() %>%
+  clean_names() %>%  # "Net Income" -> net_income; "Provider CCN" -> provider_ccn; "Year" -> year
+  mutate(
+    provider_ccn = as.character(provider_ccn),
+    year = as.integer(year)
+  )
+
+# Build RHS explicitly = all columns except dep var + panel ids
+dep   <- "net_income"
+drop_ <- c(dep, "provider_ccn", "year")
+rhs_vars <- setdiff(names(df_tmp), drop_)
+stopifnot(length(rhs_vars) > 0)
+
+# Drop NAs in used columns
+use_cols <- c(dep, "provider_ccn", "year", rhs_vars)
+df_use  <- df_tmp %>% select(all_of(use_cols)) %>% tidyr::drop_na()
+
+# Create formula strings
+rhs_fe <- paste(rhs_vars, collapse = " + ")
+form_fe_indiv <- as.formula(paste0(dep, " ~ ", rhs_fe, " | provider_ccn"))
+form_fe_tw    <- as.formula(paste0(dep, " ~ ", rhs_fe, " | provider_ccn + year"))
+
+# FE (individual)
+fe_indiv <- feols(form_fe_indiv, data = df_use)
+# FE (two-way: facility + year)
+fe_tw    <- feols(form_fe_tw,    data = df_use)
+
+# Clustered SE by facility for summaries
+cat("\n=== FE (fixest) ===\n")
+print(etable(fe_indiv, fe_tw, se = "cluster", cluster = ~provider_ccn,
+             dict = c(provider_ccn = "Facility FE", year = "Year FE"),
+             tex = FALSE))
+
+# Extract within R^2 robustly
+wr2_indiv <- tryCatch(as.numeric(fixest::fitstat(fe_indiv, "wr2")), error = function(e) NA_real_)
+wr2_tw    <- tryCatch(as.numeric(fixest::fitstat(fe_tw,    "wr2")), error = function(e) NA_real_)
+
+```
+
+
+```{r}
+# ======================
+# 5) Unified comparison table
+# ======================
+comparison_tbl <- tibble::tibble(
+  Model  = c("OLS (train)", "OLS (test)", "LASSO (test)", "FE (facility)", "FE (facility + year)"),
+  Metric = c("R^2 / Adj.R^2", "RMSE", "RMSE", "Within R^2", "Within R^2"),
+  Value  = c(
+    sprintf("%.3f / %.3f", ols_glance$r.squared, ols_glance$adj.r.squared),
+    sprintf("%.2f", ols_rmse),
+    sprintf("%.2f", rmse_lasso),
+    ifelse(is.na(wr2_indiv), "NA", sprintf("%.3f", wr2_indiv)),
+    ifelse(is.na(wr2_tw),    "NA", sprintf("%.3f", wr2_tw))
+  )
+)
+
+cat("\n=== Model Comparison Table ===\n")
+print(comparison_tbl)
+```
+
+
