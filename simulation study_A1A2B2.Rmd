@@ -1,0 +1,386 @@
+---
+title: "simulation_SNF"
+author: "Yuhan Xu"
+date: "2025-09-02"
+output: pdf_document
+---
+
+```{r}
+set.seed(2025)
+
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(readr)
+library(glmnet)
+library(Matrix)
+library(ranger)
+library(forcats)
+library(ggplot2)
+```
+
+
+```{r}
+pre_path  <- "~/Desktop/Skilled Nursing Facility Cost Report/Final_SNF_CostReport_Cleaned_2012_2019.csv"
+post_path <- "~/Desktop/Skilled Nursing Facility Cost Report/Final_SNF_CostReport_Cleaned_2012_2019.csv"
+
+df_pre  <- read_csv(pre_path, show_col_types = FALSE)
+df_post <- read_csv(post_path, show_col_types = FALSE)
+
+id_col <- c("Provider CCN","Provider_CCN","provider_ccn")
+id_col <- id_col[id_col %in% names(df_pre)][1]
+if(is.na(id_col)) stop("Provider CCN was not found in the pre data. Please confirm the list.")
+
+if(!("Year" %in% names(df_pre))) stop("cannot find column Year")
+
+# target variable
+y_candidates <- c("Net Income","Net Income from Service to Patients")
+y_var <- y_candidates[y_candidates %in% names(df_pre)][1]
+if(is.na(y_var)) stop("The target variable (Net Income or Net Income from Service to Patients) was not found.")
+
+drop_cols <- c(id_col,"Year",y_var)
+
+common_feats <- intersect(setdiff(names(df_pre), drop_cols), setdiff(names(df_post), drop_cols))
+if(length(common_feats) < 5) stop("There are too few common features. Please check the column name consistency of the two cleaned data.")
+
+pre <- df_pre %>% select(all_of(c(id_col,"Year",y_var, common_feats)))
+post <- df_post %>% select(all_of(c(id_col,"Year",y_var, common_feats)))
+
+pre <- pre %>% filter(!is.na(.data[[y_var]]))
+```
+
+
+```{r}
+# ------------------------------
+# 2) beta_star
+# ------------------------------
+
+pre$Year  <- as.factor(pre$Year)
+post$Year <- as.factor(post$Year)
+
+pre$Year  <- as.factor(pre$Year)
+post$Year <- as.factor(post$Year)
+
+esc <- function(v) ifelse(grepl("^[A-Za-z.][A-Za-z0-9_.]*$", v), v, paste0("`", v, "`"))
+
+feat_escaped <- esc(c("Year", common_feats))
+fml <- as.formula(paste("~", paste(feat_escaped, collapse = "+")))
+
+pre$Year  <- as.factor(pre$Year)
+post$Year <- as.factor(post$Year)
+
+esc <- function(v) ifelse(grepl("^[A-Za-z.][A-Za-z0-9_.]*$", v), v, paste0("`", v, "`"))
+
+feat_escaped <- esc(c("Year", common_feats))
+fml_global <- as.formula(paste("~", paste(feat_escaped, collapse = "+")))
+
+X_pre  <- model.matrix(fml_global, data = pre)
+y_pre  <- pre[[y_var]]
+X_post <- model.matrix(fml_global, data = post)
+
+col_names <- colnames(X_pre)
+if(!all(colnames(X_post) == col_names)) {
+  X_post <- X_post[, col_names, drop = FALSE]
+}
+
+col_names <- colnames(X_pre)
+if(!all(colnames(X_post) == col_names)) {
+  X_post <- X_post[, col_names, drop = FALSE]
+}
+
+ols_fit <- lm(y_pre ~ X_pre[,-1])  
+
+beta_star <- coef(lm.fit(x = X_pre, y = y_pre))  
+
+sigma_pre <- sd(y_pre - as.vector(X_pre %*% beta_star), na.rm = TRUE)
+
+sd_alpha <- 0.10 * sd(y_pre, na.rm = TRUE)
+
+col_names <- colnames(X_pre)
+if(!all(colnames(X_post) == col_names)) {
+
+  X_post <- X_post[, col_names, drop = FALSE]
+}
+
+```
+
+
+```{r}
+# ------------------------------
+# 3) Utility functions
+# ------------------------------
+rmse <- function(a,b) sqrt(mean((a-b)^2, na.rm = TRUE))
+mae  <- function(a,b) mean(abs(a-b), na.rm = TRUE)
+bias <- function(a,b) mean(a-b, na.rm = TRUE)
+sign_acc <- function(a, b, prev) {
+
+  mean(sign(a) == sign(b), na.rm = TRUE)
+}
+
+median_imputer <- function(df_train, df_new) {
+  impute_vals <- sapply(df_train, function(x){
+    if(is.numeric(x)) median(x, na.rm = TRUE) else NA
+  })
+  for(nm in names(df_new)) {
+    if(is.numeric(df_new[[nm]]) && nm %in% names(impute_vals)) {
+      idx <- which(is.na(df_new[[nm]]))
+      if(length(idx)) df_new[[nm]][idx] <- impute_vals[[nm]]
+    }
+  }
+  df_new
+}
+```
+
+
+```{r}
+simulate_DGP <- function(scenario = c("A1","A2","C2"),
+                         drift_vars = NULL,
+                         drift_scale = 0.2,           # A2
+                         delta_frac_IQR = -0.25,      # A1
+                         mar_rate = 0.15              # C2
+                        
+){
+  scenario <- match.arg(scenario)
+
+  if (!exists("fml_global", inherits = TRUE)) {
+    esc <- function(v) ifelse(grepl("^[A-Za-z.][A-Za-z0-9_.]*$", v), v, paste0("`", v, "`"))
+    feat_escaped <- esc(c("Year", common_feats))
+    fml_global <<- as.formula(paste("~", paste(feat_escaped, collapse = "+")))
+  }
+  if (!exists("col_names", inherits = TRUE)) {
+    X_pre_tmp <- model.matrix(fml_global, data = pre)
+    col_names <<- colnames(X_pre_tmp)
+  }
+
+  ids_all   <- unique(c(pre[[id_col]], post[[id_col]]))
+  alpha_map <- setNames(rnorm(length(ids_all), 0, sd_alpha), ids_all)
+  alpha_pre  <- alpha_map[ as.character(pre[[id_col]]) ]
+  alpha_post <- alpha_map[ as.character(post[[id_col]]) ]
+
+  # ---- baseline beta and error ----
+  beta_post <- beta_star
+  delta <- 0
+
+  X_post_aug <- X_post
+
+  # ---------- A1: Intercept impact ----------
+  if (scenario == "A1") {
+    delta <- delta_frac_IQR * IQR(y_pre, na.rm = TRUE)
+  }
+
+  # ---------- A2: Partial coefficient drift ----------
+  if (scenario == "A2") {
+    if (is.null(drift_vars)) {
+      set.seed(1314)
+      drift_vars <- sample(common_feats, size = min(3, length(common_feats)))
+    }
+    for (v in drift_vars) {
+      idx <- which(col_names == v)
+      if (length(idx) == 1) {
+        sgn <- sample(c(-1, 1), size = 1)
+        beta_post[idx] <- beta_post[idx] * (1 + sgn * drift_scale)
+      }
+    }
+  }
+
+  # ---------- C2: MAR missing + Median interpolation ----------
+  if (scenario == "C2") {
+    
+    pref <- c("Total Costs","Total Liabilities","Total Assets","Accounts Receivable","Total Charges")
+    driver <- pref[pref %in% common_feats][1]
+    if (is.na(driver)) {
+      num_vars <- common_feats[sapply(post[common_feats], is.numeric)]
+      driver <- num_vars[ which.max(sapply(post[num_vars], function(x) var(x, na.rm = TRUE))) ]
+    }
+
+    z <- scale(post[[driver]])
+    p_miss <- plogis(-1 + 1.2 * as.numeric(z))             
+    s <- quantile(p_miss, probs = 1 - mar_rate, na.rm = TRUE)
+    mask <- p_miss > s
+    stopifnot(length(mask) == nrow(post))
+
+    set.seed(2468)
+    miss_cols <- sample(common_feats, size = max(3, floor(length(common_feats) * 0.2)))
+
+    Xraw_post <- post[, common_feats, drop = FALSE]
+    if (length(miss_cols) > 0) Xraw_post[mask, miss_cols] <- NA
+
+    Ximp_post <- median_imputer(pre[, common_feats, drop = FALSE], Xraw_post)
+
+    X_post_aug <- model.matrix(fml_global,
+                               data = cbind(post[, c("Year"), drop = FALSE], Ximp_post))
+    miss_in_aug <- setdiff(col_names, colnames(X_post_aug))
+    if (length(miss_in_aug) > 0) {
+      for (nm in miss_in_aug) {
+        X_post_aug <- cbind(X_post_aug, setNames(matrix(0, nrow(X_post_aug), 1), nm))
+      }
+    }
+    X_post_aug <- X_post_aug[, col_names, drop = FALSE]
+  }
+
+  # ---- generate Y ----
+  eps_pre  <- rnorm(nrow(pre),  0, sigma_pre)
+  eps_post <- rnorm(nrow(post), 0, sigma_pre)
+
+  y_pre_syn  <- alpha_pre  + as.vector(X_pre  %*% beta_star) + eps_pre
+  y_post_syn <- delta + alpha_post + as.vector(X_post_aug %*% beta_post) + eps_post
+
+  list(
+    X_pre  = X_pre,
+    X_post = X_post_aug,
+    y_pre  = y_pre_syn,
+    y_post = y_post_syn,
+    drift_vars = if (scenario == "A2") drift_vars else character(0),
+    scenario = scenario
+  )
+}
+
+```
+
+
+```{r}
+# ------------------------------
+# 5) Training and Evaluation
+# ------------------------------
+fit_and_eval <- function(Xtr, ytr, Xte, yte) {
+  res <- list()
+  
+  # 1) OLS + Year FE
+  ols <- lm.fit(x = Xtr, y = ytr)
+  pred_ols <- as.vector(Xte %*% coef(ols))
+  res$OLS_YearFE <- c(
+    RMSE = rmse(pred_ols, yte),
+    MAE  = mae(pred_ols, yte),
+    Bias = bias(pred_ols, yte),
+    SignAcc = sign_acc(pred_ols, yte, prev = NULL)
+  )
+  
+# 2) LASSO（with Year)
+
+  cvfit <- cv.glmnet(x = Xtr, y = ytr, alpha = 1, nfolds = 5, family = "gaussian", standardize = TRUE)
+  pred_lasso <- as.vector(predict(cvfit, newx = Xte, s = "lambda.min"))
+  res$LASSO_CV <- c(
+    RMSE = rmse(pred_lasso, yte),
+    MAE  = mae(pred_lasso, yte),
+    Bias = bias(pred_lasso, yte),
+    SignAcc = sign_acc(pred_lasso, yte, prev = NULL)
+  )
+  
+  # 3) Random Forest（ranger）
+rf_block <- function(Xtr, ytr, Xte) {
+
+  keep_cols <- setdiff(colnames(Xtr), "(Intercept)")
+  Xtr <- Xtr[, keep_cols, drop = FALSE]
+  Xte <- Xte[, keep_cols, drop = FALSE]
+
+  tr_names <- make.names(colnames(Xtr), unique = TRUE)
+  te_names <- make.names(colnames(Xte), unique = TRUE)
+
+  colnames(Xtr) <- tr_names
+  colnames(Xte) <- te_names
+
+  missing_in_te <- setdiff(tr_names, colnames(Xte))
+  if (length(missing_in_te) > 0) {
+    for (nm in missing_in_te) Xte <- cbind(Xte, setNames(data.frame(0), nm))
+  }
+  Xte <- Xte[, tr_names, drop = FALSE]
+
+  # fit and predict
+  Xtr_df <- as.data.frame(Xtr)
+  Xte_df <- as.data.frame(Xte)
+
+  rf <- ranger(
+    data = data.frame(y = ytr, Xtr_df),
+    formula = y ~ .,
+    num.trees = 500,
+    mtry = max(3, floor(ncol(Xtr_df)/3)),
+    min.node.size = 5,
+    seed = 99
+  )
+  predict(rf, data = Xte_df)$predictions
+}
+
+  out <- bind_rows(res, .id = "Model")
+  out
+}
+```
+
+
+```{r}
+# ------------------------------
+# 6) Main loop: Three scenes, each repeated B times
+# ------------------------------
+B <- 200  
+scenarios <- c("A1","A2","C2")
+
+all_results <- list()
+
+for (sc in scenarios) {
+  message("Running scenario: ", sc)
+  sc_res <- vector("list", B)
+  
+  for (b in 1:B) {
+    if(sc == "A2"){
+      # A2 drift ±20%
+      dgp <- simulate_DGP("A2", drift_vars = NULL, drift_scale = 0.2)
+    } else if (sc == "A1"){
+      # A1 intercept impact: -0.25*IQR(y_pre)
+      dgp <- simulate_DGP("A1", delta_frac_IQR = -0.25)
+    } else {
+      # C2 miss rate15%
+      dgp <- simulate_DGP("C2", mar_rate = 0.15)
+    }
+    
+    # Train & evaluation
+    res_b <- fit_and_eval(dgp$X_pre, dgp$y_pre, dgp$X_post, dgp$y_post)
+    res_b$rep <- b
+    res_b$scenario <- sc
+    sc_res[[b]] <- res_b
+  }
+  
+  all_results[[sc]] <- bind_rows(sc_res)
+}
+
+results_df <- bind_rows(all_results)
+
+```
+
+
+```{r}
+# ------------------------------
+# 7) Summarize
+# ------------------------------
+summary_tbl <- results_df %>%
+  group_by(scenario, Model) %>%
+  summarise(
+    RMSE_mean = mean(RMSE), RMSE_sd = sd(RMSE),
+    MAE_mean  = mean(MAE),  MAE_sd  = sd(MAE),
+    Bias_mean = mean(Bias), Bias_sd = sd(Bias),
+    SignAcc_mean = mean(SignAcc), SignAcc_sd = sd(SignAcc),
+    .groups = "drop"
+  ) %>%
+  arrange(scenario, RMSE_mean)
+
+write_csv(results_df, "simulation_results_all_reps.csv")
+write_csv(summary_tbl, "simulation_results_summary.csv")
+
+p <- summary_tbl %>%
+  mutate(Model = factor(Model, levels = c("OLS_YearFE","LASSO_CV","RF"))) %>%
+  ggplot(aes(x = Model, y = RMSE_mean)) +
+  geom_col() +
+  facet_wrap(~scenario, scales = "free_y") +
+  geom_errorbar(aes(ymin = RMSE_mean - RMSE_sd, ymax = RMSE_mean + RMSE_sd), width = .2) +
+  labs(title = "Simulation RMSE by Scenario (mean ± sd over reps)",
+       x = NULL, y = "RMSE") +
+  theme_minimal(base_size = 13)
+ggsave("simulation_rmse_bar.png", p, width = 9, height = 4.8, dpi = 200)
+
+message("Done：",
+        "\n- simulation_results_all_reps.csv",
+        "\n- simulation_results_summary.csv",
+        "\n- simulation_rmse_bar.png")
+
+```
+
+
+
